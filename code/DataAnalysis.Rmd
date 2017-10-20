@@ -1,0 +1,480 @@
+---
+title: "QuantSeq Data Differential Expression Analysis"
+output:
+  html_notebook:
+    code_folding: hide
+    toc: yes
+    toc_float: yes
+  html_document:
+    code_folding: hide
+    toc: yes
+    toc_float: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(ggplot2)
+library(plotly)
+library(limma)
+library(plyr)
+library(dplyr)
+```
+
+
+## Quantseq Dataset and Metadata
+Read Data.
+```{r, eval=TRUE, include=FALSE}
+# timepoint <- 4
+# dat <- readRDS(paste0("../data/dat_", timepoint, ".rds"))
+# counts <- dat$counts
+# covset <- dat$covset
+```
+
+## QuasiSeq Method
+
+```{r, eval=TRUE, include=FALSE}
+library(QuasiSeq)
+# Function creating Design List -------------------------------------------
+
+
+# Description: this function creates design list which consists of full model, and reduced models by deleting 1
+# column in the covset set, and creates test.mat which is a matrix that
+# each row's elements are 1 and the position of reduced model in the design list, and name of the row
+# is the name of deleted column in the covset data frame
+# input: covset: data frame containing all considered covariates
+# ouput: a list  having 2 elements: design.list and test.mat
+list_f <- function(covset){
+  colname <- colnames(covset)
+  n <- ncol(covset)
+  design.list <- list()
+  design.list[[1]] <- model.matrix(as.formula(paste(" ~ ", paste(colname, collapse= "+"))), data = covset)
+  if(n==1){
+    design.list[[2]] <-  rep(1, nrow(covset))
+  }else{
+    for(i in 1:n)design.list[[i+1]] <- model.matrix(as.formula(paste(" ~ ", paste(colname[-i], collapse= "+"))) , data = covset)
+  }
+  test.mat <- matrix(c(rep(1, n), 2:(n+1)), byrow = F, ncol = 2)
+  rownames(test.mat) <- colname
+  
+  return(list(design.list = design.list, test.mat = test.mat))
+}
+
+
+
+# Function to fit QuaSiSeq ------------------------------------------------
+
+
+# Description: This functions returns value of variable selection criteria when running QuasiSeq, 
+
+#Input: counts: RNAseq count data set
+#       ConCov: data frame containing covariates 
+#Output: return fit from QL.fit, result from QL.results and and res_sel from selection criteria
+fit_f <- function(counts, ConCov){ # iter <- 1
+  log.offset <- log(apply(counts, 2, quantile, 0.75))
+  list_out <- list_f(ConCov)
+  design.list <- list_out$design.list
+  test.mat <- list_out$test.mat
+  fit <- suppressWarnings(QL.fit(counts, design.list = design.list, test.mat = test.mat, # dim(counts)
+                                 log.offset = log.offset, print.progress=TRUE,
+                                 Model = "NegBin"))
+  sink("aux")
+  result<- QL.results(fit, Plot = FALSE)
+  sink(NULL)
+  out <- list(fit = fit, result = result, list_out = list_out)
+  return(out)
+}
+
+## Function to obtain all pvalue, qvalue, log2fc, and adjusted data 
+## from QuasiSeq
+Quasiseq_pqfc <- function(fit_f_out){
+  res <- fit_f_out$result
+  fit <- fit_f_out$fit
+  list_out <- fit_f_out$list_out
+  pvalue <- res$P.values$QLSpline
+  qvalue <- res$Q.values$QLSpline
+  log2fc <- fit$coefficients[,-1]*log2(exp(1))
+  colnames(log2fc) <- colnames(pvalue)
+  rownames(pvalue) <- rownames(qvalue) <- rownames(log2fc) <- rownames(fit$mn.cnt)
+  
+  out <- list(pvalue = pvalue, qvalue = qvalue, log2fc = log2fc)
+  
+}
+
+## Function to obtain adjusted data
+Quasiseq_adjusted_data <- function(counts, ConCov, fit_f_out){
+  dm <- fit_f_out$list_out$design.list[[1]]
+  out <- plyr::llply(1:ncol(ConCov), function(i){
+        if(is.factor(ConCov[,i]) | is.character(ConCov[,i])) {
+          ct <- grep(paste0(names(ConCov)[i]),  x = colnames(dm), value = F)
+        }else{
+          ct <- grep(paste0(names(ConCov)[i], "$"),  x = colnames(dm), value = F)
+        }
+    # Xb1 + Xb2, adjusted for Xb2
+  Xb1 <- fit_f_out$fit$coefficients[,ct]%*%t(dm[,ct])
+  log.offset <- log(apply(counts, 2, quantile, .75))
+  adj1 <- counts/exp(Xb1)
+  adj <- sweep(adj1, MARGIN = 2, STATS = exp(log.offset - mean(log.offset)),FUN = "/")
+  adj
+  }
+  )
+  names(out) <- colnames(ConCov)
+  out <- list(counts = counts, adjusted = out)
+  out
+  
+  }
+
+QuasiSeq_hist_plot <- function(Quasiseq_pqfc_out, FDR.level = .05, bin.width = 0.05, timepoint){
+  pvalue <- Quasiseq_pqfc_out$pvalue
+  qvalue <- Quasiseq_pqfc_out$qvalue
+  DEGs <- apply(qvalue <= FDR.level, 2, sum)
+  VoomPvOut.melt <- reshape::melt(pvalue, measure.vars = .)
+  names(VoomPvOut.melt)[2:3] <- c("Covariate", "pvalue")
+  VoomPvOut.melt$Covariate <- factor(VoomPvOut.melt$Covariate, 
+                                        levels = colnames(pvalue))
+  levels(VoomPvOut.melt$Covariate)<- paste(levels(VoomPvOut.melt$Covariate),  DEGs[levels(VoomPvOut.melt$Covariate)], sep = ", #DEGs = ")
+  p <- ggplot2::ggplot(data = VoomPvOut.melt, aes(x = pvalue))+
+    ggplot2::geom_histogram( breaks=seq(0,1,by=bin.width))+ 
+    ggplot2::facet_grid(~ Covariate, scales = "free_y") +
+    ggplot2::labs(title = paste0("dpv = ", timepoint, ", p-value Histogram,  FDR = ", FDR.level))+
+    ggplot2::theme(axis.text.x = element_text(angle = 90, hjust = 1))
+    
+  out <- list(p = p, VoomPvOut.melt = VoomPvOut.melt)
+}
+
+QuasiSeq_volcano_plot <- function(Quasiseq_pqfc_out, timepoint){
+  pvalue <- Quasiseq_pqfc_out$pvalue
+  log2fc <- Quasiseq_pqfc_out$log2fc
+  log2fcs <- reshape::melt(log2fc)
+  colnames(log2fcs) <- c("Gene", "Effect", "log2fc")
+  pvs <- reshape::melt(pvalue)  
+  colnames(pvs) <- c("Gene", "Effect", "pvalue")
+  p.fc.all <- cbind(pvs, log2fc = log2fcs$log2fc)
+  p.fc.all$Effect <- factor(p.fc.all$Effect, levels = colnames(pvalue))
+  p1 <- ggplot2::ggplot(data = p.fc.all, aes(x = log2fc, y = -log10(pvalue))) +
+    ggplot2::geom_point(pch = 16, size = .2)+
+    ggplot2::facet_grid(~Effect)+
+    ggtitle(label = paste0("dpv =", timepoint, ", Volcano Plot")) + 
+    ggplot2::geom_hline( yintercept = 2)
+  p2 <- ggplot2::ggplot(data = p.fc.all, aes(x = log2fc, y = -log10(pvalue))) +
+    ggplot2::geom_point(pch = 16, size = .2)+
+    ggplot2::facet_grid(~Effect)+
+    ggtitle(label = paste0("dpv =", timepoint, ", Volcano Plot")) + 
+    ggplot2::geom_hline( yintercept = 2) +
+    ggplot2::xlim(-10, 10)
+  out <- list(p1 = p1, p2 = p2, p.fc.all = p.fc.all)
+  out
+}
+
+QuasiSeq_wrap_one <- function(timepoint){
+  dat <- readRDS(paste0("../data/dat_", timepoint, ".rds"))
+  counts <- dat$counts
+  covset <- dat$covset
+  if(length(unique(covset$VacStatue))==1){
+    ConCov <- covset[, c("WUR", "RINe", "Plate")]
+  }else{
+    vxw <- model.matrix(~WUR*VacStatue, data = covset)
+    C <- matrix(c(1, 0, 0, 0, 
+              0, 1, 0, 1/2,
+              0, 0, 1, 1/2,
+              0, 0, 0, 1), byrow = T, ncol = 4)
+    vxw1 <- as.data.frame(vxw%*%solve(C))
+    ConCov <- data.frame(WUR = vxw1[, 2], Vac = vxw1[,3], int = vxw1[, 4], 
+                     covset[, c("RINe","Plate")])
+  }
+  fit_f_out <- fit_f(counts, ConCov)
+  Quasiseq_pqfc_out <- Quasiseq_pqfc(fit_f_out)
+  QuasiSeq_volcano_plot_out <- QuasiSeq_volcano_plot(Quasiseq_pqfc_out, timepoint)
+  QuasiSeq_hist_plot_out <- QuasiSeq_hist_plot(Quasiseq_pqfc_out, FDR.level = .2, bin.width = 0.05, timepoint)
+  Quasiseq_adjusted_data_out <- Quasiseq_adjusted_data(counts, ConCov, fit_f_out)
+  dir.create("../output/QuasiSeq")
+  dpv <- paste0("../output/QuasiSeq/dpv_", timepoint)
+  dir.create(path = dpv)
+  saveRDS(Quasiseq_pqfc_out, file = paste0(dpv,"/pqfc_dpv_", timepoint, ".rds"))
+  saveRDS(QuasiSeq_hist_plot_out, file = paste0(dpv,"/hist_dpv_", timepoint, ".rds"))
+  saveRDS(QuasiSeq_volcano_plot_out, file = paste0(dpv,"/volcano_dpv_", timepoint, ".rds"))
+  saveRDS(Quasiseq_adjusted_data_out, file = paste0(dpv,"/adjusted_dpv_", timepoint, ".rds"))
+  out1 <- list(Quasiseq_pqfc_out = Quasiseq_pqfc_out, 
+              QuasiSeq_volcano_plot_out = QuasiSeq_volcano_plot_out, 
+              QuasiSeq_hist_plot_out = QuasiSeq_hist_plot_out,
+              Quasiseq_adjusted_data_out = Quasiseq_adjusted_data_out)
+  saveRDS(out1, file = paste0(dpv,"/output_dpv_", timepoint, ".rds"))
+  out <- list(fit_f_out = fit_f_out, Quasiseq_pqfc_out = Quasiseq_pqfc_out, 
+              QuasiSeq_volcano_plot_out = QuasiSeq_volcano_plot_out, 
+              QuasiSeq_hist_plot_out = QuasiSeq_hist_plot_out,
+              Quasiseq_adjusted_data_out= Quasiseq_adjusted_data_out)
+  out
+  
+}
+
+
+timevec <- c(4,  7, 11, 14, 28, 32, 35, 39, 42, 56)
+out <- plyr::llply(timevec, function(timepoint){
+  out <- QuasiSeq_wrap_one(timepoint)
+  out
+
+})
+names(out) <- timevec
+saveRDS(out, file = paste0("../output/QuasiSeq/QuasiSeq_out_all.rds"))
+# out <- readRDS(file = paste0("../output/QuasiSeq/QuasiSeq_out_all.rds"))
+
+timevec <- c(4,  7, 11, 14, 28, 32, 35, 39, 42, 56)
+
+
+p.fc.all <- data.frame()
+  
+for(i in 1:length(timevec)){
+  p.fc.all <- rbind(p.fc.all, cbind(out[[i]]$QuasiSeq_volcano_plot_out$p.fc.all, dpv = rep(timevec[i], nrow(out[[i]]$QuasiSeq_volcano_plot_out$p.fc.all) )))
+  }
+
+
+  p <- ggplot2::ggplot(data = p.fc.all, aes(x = log2fc, y = -log10(pvalue))) +
+    ggplot2::geom_point(pch = 16, size = .1, alpha = .2)+
+    ggplot2::facet_grid(Effect ~ dpv, scales="free_y")+
+    ggtitle(label = paste0("QuasiSeq,  Volcano Plot")) + 
+    ggplot2::geom_hline( yintercept = 2)+
+    ggplot2::xlim(-5, 5)
+p
+  ggsave(filename = "../output/QuasiSeq/QuasiSeq_VolcanoPlot.png")
+  
+
+  VoomPv_out_melt <- data.frame()
+
+for(i in 1:length(timevec)){
+  VoomPv_out_melt <- rbind(VoomPv_out_melt,
+                           cbind(out[[i]]$QuasiSeq_hist_plot_out$VoomPvOut.melt, dpv = rep(timevec[i], nrow(out[[i]]$QuasiSeq_hist_plot_out$VoomPvOut.melt) )))
+  }
+
+p <- ggplot2::ggplot(data = VoomPv_out_melt, aes(x = pvalue))+
+    ggplot2::geom_histogram( breaks=seq(0,1,by=.05))+
+    ggplot2::facet_grid(dpv ~Covariate, scales = "free_y") +
+    ggplot2::labs(title = paste0("QuasiSeq, p-value Histogram,  FDR = .2"))+
+    ggplot2::theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+p
+  ggsave(gridExtra::grid.arrange(out[[1]]$QuasiSeq_hist_plot_out$p, 
+                          out[[2]]$QuasiSeq_hist_plot_out$p, 
+                          out[[3]]$QuasiSeq_hist_plot_out$p, 
+                          out[[4]]$QuasiSeq_hist_plot_out$p, 
+                          out[[5]]$QuasiSeq_hist_plot_out$p, 
+                          out[[6]]$QuasiSeq_hist_plot_out$p, 
+                          out[[7]]$QuasiSeq_hist_plot_out$p, 
+                          out[[8]]$QuasiSeq_hist_plot_out$p, 
+                          out[[9]]$QuasiSeq_hist_plot_out$p, 
+                          out[[10]]$QuasiSeq_hist_plot_out$p), filename = "../output/QuasiSeq/QuasiSeq_HistogramPlot.png", width = 20,height = 10)
+
+
+```
+Check Results.
+
+## Voom Method
+
+```{r}
+VoomPv <- function(counts, AllCov){
+  dm <- model.matrix(formula(paste0("~", paste0(names(AllCov), collapse = "+"))), data = AllCov)
+  colnames(dm)[1] <- "Intercept"
+  vout <- voom(counts = counts, design = dm, lib.size = apply(counts, 2, quantile, .75), plot = F)
+  fit <- lmFit(vout)
+  pvalue <- plyr::ldply(1:ncol(AllCov), function(i){
+    if(is.factor(AllCov[,i]) | is.character(AllCov[,i])) {
+      ct <- paste0(grep(paste0(names(AllCov)[i]),  x = colnames(dm), value = T), collapse = ",  ")
+    }else{
+      ct <- paste0(grep(paste0(names(AllCov)[i], "$"),  x = colnames(dm), value = T), collapse = ",  ") 
+    }
+    C.matrix <- eval(parse(text=paste0("makeContrasts(",  ct, ",levels = dm)")))
+    fit1 <- contrasts.fit(fit, contrasts =C.matrix)
+    fit1 <- eBayes(fit1)
+    tt <- topTableF(fit1, sort ="none", n = Inf)
+    pv <- tt$P.Value
+  })
+  
+  pvalue <- t(pvalue)
+  qvalue <- apply(pvalue, 2, function(x)tcrmrnaseq:::jabes.q(x))
+  log2fc <- fit$coefficients[,-1]
+  colnames(pvalue) <- colnames(qvalue) <- colnames(log2fc) <- colnames(AllCov)
+  rownames(pvalue) <- rownames(qvalue) <- rownames(fit$coefficients)
+  adj <- plyr::llply(1:ncol(AllCov), function(i){
+    y1 <- vout$E - fit$coefficients[, -c(1,i+1)]%*%t(dm[,-c(1,i+1)])
+    y1
+  })
+  names(adj) <- colnames(AllCov)
+  res <- list(counts = counts, 
+              AllCov = AllCov,
+              y = vout$E, 
+              pvalue = pvalue, #VoomOut  = vout, 
+              qvalue = qvalue,
+              log2fc = log2fc,
+              adj = adj)
+  res
+}
+
+
+
+Voom_hist_plot <- function(VoomPv_out, FDR.level = .05, bin.width = 0.05, timepoint){
+  pvalue <- VoomPv_out$pvalue
+  qvalue <- VoomPv_out$qvalue
+  DEGs <- apply(qvalue <= FDR.level, 2, sum)
+  VoomPvOut.melt <- reshape::melt(pvalue, measure.vars = .)
+  names(VoomPvOut.melt)[2:3] <- c("Covariate", "pvalue")
+  VoomPvOut.melt$Covariate <- factor(VoomPvOut.melt$Covariate, 
+                                        levels = colnames(pvalue))
+  levels(VoomPvOut.melt$Covariate)<- paste(levels(VoomPvOut.melt$Covariate),  DEGs[levels(VoomPvOut.melt$Covariate)], sep = ", #DEGs = ")
+  p <- ggplot2::ggplot(data = VoomPvOut.melt, aes(x = pvalue))+
+    ggplot2::geom_histogram( breaks=seq(0,1,by=bin.width))+ 
+    ggplot2::facet_grid(~ Covariate, scales = "free_y") +
+    ggplot2::labs(title = paste0("Voom, dpv = ", timepoint, ", p-value Histogram,  FDR = ", FDR.level))+
+    ggplot2::theme(axis.text.x = element_text(angle = 90, hjust = 1))
+    
+  out <- list(p=p, VoomPvOut.melt = VoomPvOut.melt)
+  out
+}
+
+Voom_volcano_plot <- function(VoomPv_out, timepoint){
+  pvalue <- VoomPv_out$pvalue
+  log2fc <- VoomPv_out$log2fc
+  log2fcs <- reshape::melt(log2fc)
+  colnames(log2fcs) <- c("Gene", "Effect", "log2fc")
+  pvs <- reshape::melt(pvalue)  
+  colnames(pvs) <- c("Gene", "Effect", "pvalue")
+  p.fc.all <- cbind(pvs, log2fc = log2fcs$log2fc)
+  p.fc.all$Effect <- factor(p.fc.all$Effect, levels = colnames(pvalue))
+  p <- ggplot2::ggplot(data = p.fc.all, aes(x = log2fc, y = -log10(pvalue))) +
+    ggplot2::geom_point(pch = 16, size = .2)+
+    ggplot2::facet_grid(~Effect)+
+    ggtitle(label = paste0("dpv =", timepoint, ", Volcano Plot")) + 
+    ggplot2::geom_hline( yintercept = 2)
+  out <- list(p = p, p.fc.all = p.fc.all)
+  out
+}
+
+Voom_wrap_one <- function(timepoint){
+  dat <- readRDS(paste0("../data/dat_", timepoint, ".rds"))
+  counts <- dat$counts
+  covset <- dat$covset
+  if(length(unique(covset$VacStatue))==1){
+    AllCov <- covset[, c("WUR", "RINe", "Plate")]
+  }else{
+    vxw <- model.matrix(~WUR*VacStatue, data = covset)
+    C <- matrix(c(1, 0, 0, 0, 
+              0, 1, 0, 1/2,
+              0, 0, 1, 1/2,
+              0, 0, 0, 1), byrow = T, ncol = 4)
+    vxw1 <- as.data.frame(vxw%*%solve(C))
+    AllCov <- data.frame(WUR = vxw1[, 2], Vac = vxw1[,3], int = vxw1[, 4], 
+                     covset[, c("RINe","Plate")])
+  }
+  VoomPv_out <- VoomPv(counts, AllCov)
+  Voom_volcano_plot_out <- Voom_volcano_plot(VoomPv_out, timepoint)
+  Voom_hist_plot_out <- Voom_hist_plot(VoomPv_out, FDR.level = .2, bin.width = 0.05, timepoint)
+  dir.create( paste0("../output/Voom"))
+  dpv <- paste0("../output/Voom/dpv_", timepoint)
+  dir.create(path = dpv)
+  saveRDS(VoomPv_out, file = paste0(dpv,"/pqfc_dpv_", timepoint, ".rds"))
+  saveRDS(Voom_hist_plot_out, file = paste0(dpv,"/hist_dpv_", timepoint, ".rds"))
+  saveRDS(Voom_volcano_plot_out, file = paste0(dpv,"/volcano_dpv_", timepoint, ".rds"))
+  out1 <- list(VoomPv_out = VoomPv_out, 
+              Voom_volcano_plot_out = Voom_volcano_plot_out, 
+              Voom_hist_plot_out = Voom_hist_plot_out)
+  saveRDS(out1, file = paste0(dpv,"/output_dpv_", timepoint, ".rds"))
+  
+  out1
+  
+}
+
+
+
+```
+
+```{r}
+
+timevec <- c(4,  7, 11, 14, 28, 32, 35, 39, 42, 56)
+out <- plyr::llply(timevec, function(timepoint){
+  out <- Voom_wrap_one(timepoint)
+  out
+})
+names(out) <- timevec
+names(out)
+# out
+adj_data <- plyr::llply(1:length(timevec), function(timepoint){
+  out[[timepoint]]$VoomPv_out$adj
+})
+names(adj_data) <- timevec
+
+saveRDS(adj_data, file = paste0("../output/Voom/adj_data.rds"))
+p.fc.all <- data.frame()
+  
+for(i in 1:length(timevec)){
+  p.fc.all <- rbind(p.fc.all, cbind(out[[i]]$Voom_volcano_plot_out$p.fc.all, dpv = rep(timevec[i], nrow(out[[i]]$Voom_volcano_plot_out$p.fc.all) )))
+  }
+
+
+  p <- ggplot2::ggplot(data = p.fc.all, aes(x = log2fc, y = -log10(pvalue))) +
+    ggplot2::geom_point(pch = 16, size = .1, alpha = .2)+
+    ggplot2::facet_grid(Effect ~ dpv, scales="free_y")+
+    ggtitle(label = paste0("Voom,  Volcano Plot")) + 
+    ggplot2::geom_hline( yintercept = 2)
+p
+  ggsave(filename = "../output/Voom/Voom_VolcanoPlot.png")
+  
+
+  VoomPv_out_melt <- data.frame()
+
+for(i in 1:length(timevec)){
+  VoomPv_out_melt <- rbind(VoomPv_out_melt,
+                           cbind(out[[i]]$Voom_hist_plot_out$VoomPvOut.melt, dpv = rep(timevec[i], nrow(out[[i]]$Voom_hist_plot_out$VoomPvOut.melt) )))
+  }
+
+p <- ggplot2::ggplot(data = VoomPv_out_melt, aes(x = pvalue))+
+    ggplot2::geom_histogram( breaks=seq(0,1,by=.05))+
+    ggplot2::facet_grid(dpv ~Covariate, scales = "free_y") +
+    ggplot2::labs(title = paste0("Voom, p-value Histogram,  FDR = .2"))+
+    ggplot2::theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+# p
+  ggsave(gridExtra::grid.arrange(out[[1]]$Voom_hist_plot_out$p, 
+                          out[[2]]$Voom_hist_plot_out$p, 
+                          out[[3]]$Voom_hist_plot_out$p, 
+                          out[[4]]$Voom_hist_plot_out$p, 
+                          out[[5]]$Voom_hist_plot_out$p, 
+                          out[[6]]$Voom_hist_plot_out$p, 
+                          out[[7]]$Voom_hist_plot_out$p, 
+                          out[[8]]$Voom_hist_plot_out$p, 
+                          out[[9]]$Voom_hist_plot_out$p, 
+                          out[[10]]$Voom_hist_plot_out$p), filename = "../output/Voom/Voom_HistogramPlot.png", width = 20,height = 10)
+
+
+```
+
+
+```{r}
+# dim(dat$counts)
+# plot(apply(dat$counts, 1, sum))
+# dat$counts[which(apply(dat$counts, 1, sum) >2e+06),]
+# dim(dat$counts)
+```
+
+
+## Looking at DEGs across all time points and both Vaccination and non-vacination. 
+
+
+```{r}
+# timepoint <- timevec[5]
+# rawdat <- readRDS(paste0("../data/dat_", timepoint, ".rds"))
+# covset <- rawdat$covset
+# counts <- rawdat$counts
+# adjdata <- readRDS(paste0("../output/Voom/dpv_", timepoint, "/output_dpv_", timepoint, ".rds"))
+# DEGs <- t(plyr::laply(1:ncol(adjdata$VoomPv_out$pvalue), function(i)sort(adjdata$VoomPv_out$pvalue[,i], index.return = T)$ix))
+# colnames(DEGs) <- colnames(adjdata$VoomPv_out$pvalue)
+# head(DEGs)
+# newdata <- cbind( t(counts[DEGs[i], ]),
+#                       adj_WUR = adjdata$VoomPv_out$adj$WUR[DEGs[i],],
+#                       adj_Vac = adjdata$VoomPv_out$adj$Vac[DEGs[i],], 
+#                   WUR = covset$WUR, 
+#                   Vac = covset$VacStatue,
+#                   Time = covset$
+#                   )
+# newdata
+# counts[DEGs[i], ]
+```
+

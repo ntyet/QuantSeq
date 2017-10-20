@@ -1,0 +1,323 @@
+---
+title: "QuantSeq Data Exploratory Analysis"
+output:
+  html_notebook:
+    code_folding: hide
+    toc: yes
+    toc_float: yes
+  html_document:
+    code_folding: hide
+    toc: yes
+    toc_float: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(ggplot2)
+library(plotly)
+```
+
+
+## Quantseq Dataset and Metadata
+
+Quantseq data set
+
+```{r}
+getwd()
+dat <- read.csv("../raw-data/coinfection 191 samples QuantSeq matched metadata PHGC16 output from Bluebee ssc10.2.csv")
+dim(dat)
+head(colnames(dat))
+head(rownames(dat))
+head(dat$X)
+head(levels(dat$X))
+length(levels(dat$X))
+x <- plyr::laply(strsplit(as.character(dat$X), split = "__"), function(ss) length(ss))
+
+dat <- dat[-which(x==2),]
+rownames(dat) <- dat$X
+dat <- dat[, -1]
+colnames(dat) <- gsub(pattern = "X", "", colnames(dat))
+dat <- dat[, -which(log(apply(dat, 2, sum)) <= 10)] 
+# dat[which(apply(dat, 1, sum)/sum(dat)>.01),]
+dat <- dat[-which(apply(dat, 1, sum)/sum(dat)>.01)[1:3],] # delete hemoglobin genes
+# barplot(apply(dat, 1, sum)/sum(dat))
+# dat[which(apply(dat, 1, sum)/sum(dat) >.05),]
+```
+
+
+
+
+Metadata
+
+```{r}
+metadata <- read.csv("../raw-data/coinfectionPHGC16metadata191samples (1).csv")
+metadata <- metadata%>%dplyr::arrange(RNAid) %>% 
+  dplyr::mutate(RNAid = as.character(RNAid), 
+                Plate = as.factor(Plate)) %>% 
+  dplyr::filter(RNAid %in%colnames(dat))
+dat <- dat[, metadata$RNAid]
+# check colnames of dat and metadata are the same
+all(colnames(dat)==metadata$RNAid)
+alldat <- list(counts = dat, metadata = metadata)
+saveRDS(alldat, file = paste0("../data/dat.rds"))
+```
+How many samples per each combination of WUR and Vac Status?
+```{r}
+library(dplyr)
+str(metadata)
+table(metadata$VacStatue, metadata$WUR, metadata$dpv)
+
+num.sample <- metadata %>% 
+  dplyr::mutate(WUR_Vac = paste0(WUR, "_", VacStatue), 
+                Litters = as.character(gsub("([0-9]+).*$", "\\1", Litter)),
+                PHGC_16_PigID = as.factor(PHGC_16_PigID)) %>%
+  dplyr::mutate(WUR_Vac = factor(WUR_Vac, levels = c( "AA_nonVaVac", "AB_nonVaVac", "AA_Vac", "AB_Vac"))) #%>%
+  #dplyr::filter(RINe >=7)
+
+ggplot2::ggplot(dat =num.sample, aes(x = dpv)) +
+  ggplot2::geom_bar(aes(fill = WUR_Vac))+
+  ggplot2::scale_x_continuous(breaks=unique(num.sample$dpv))
+
+```
+
+
+Nummber of pigs per Litter for 7 litters that has RNA samples
+```{r }
+ggplot2::ggplot(dat =num.sample, aes(x = dpv)) +
+  ggplot2::geom_bar(aes(fill = Litters))+
+  ggplot2::scale_x_continuous(breaks=unique(num.sample$dpv))
+
+```
+
+RINe for each pig over dpv
+
+```{r }
+ggplot2::ggplot(dat =num.sample, aes(x = dpv, y = RINe,group = PHGC_16_PigID, color = PHGC_16_PigID)) +
+  ggplot2::geom_line()
+  ggplot2::scale_x_continuous(breaks=unique(num.sample$dpv))
+
+```
+
+```{r}
+num.sample[num.sample$RINe<4,c("RNAid", "RINe")]
+sum(num.sample$RINe >=7)
+```
+
+
+## Explanatory Analysis of QuantSeq data
+```{r}
+library(DESeq2)
+
+```
+
+First filtering Quantseq data using threshold 0.5 and 3 nonzero counts.
+```{r}
+dat1 <- dat%>%filter(rowMeans(dat) >=.5 & rowSums(dat>0) >=3)
+
+```
+
+Normalize data using upper quartile. 
+```{r}
+offset <- apply(dat1, 2, quantile,  .75)
+
+dat2 <- sweep(x = dat1, MARGIN = 2, STATS = exp(log(offset) - log(mean(offset))), 
+              FUN = "/")
+
+
+```
+
+Multidensity function from DESeq2
+```{r}
+geneplotter::multidensity( dat2,
+    xlab="mean counts", xlim=c(0, 1000))
+
+
+```
+
+multiecdf
+```{r}
+
+dat3 <- reshape2::melt(dat2)
+head(dat3)
+geneplotter::multiecdf(dat3$value~dat3$variable,xlab="mean counts", xlim=c(0, 1000))
+
+```
+
+PCA for top 500 genes showing the highest variance.
+```{r}
+library(limma)
+ntop = nrow(dat2)
+pcaplot <- function(timepoint = 4){
+  
+ncolum <- which(num.sample$dpv == timepoint)
+  vout <- voom(counts = dat2[, ncolum], 
+             lib.size = apply(dat2[, ncolum], 2, quantile, .75) )
+Pvars <- genefilter::rowVars(vout$E)
+select <- order(Pvars, decreasing = TRUE)[seq_len(min(ntop, 
+        length(Pvars)))]
+dataset <- vout$E[select,]
+  pca <- prcomp(t(dataset), scale = F)
+  percenvar <- round(100*pca$sdev^2/sum(pca$sdev^2),1)
+  dataGG <- data.frame(PC1 = pca$x[,1], PC2 = pca$x[,2],
+                       percenvar = percenvar,
+                       Name = colnames(dat2[, ncolum]),
+                       WUR = num.sample$WUR[ncolum],
+                       Vac = num.sample$VacStatue[ncolum],
+                       Time = num.sample$dpv[ncolum], 
+                       Litters = num.sample$Litters[ncolum])
+  rownames(dataGG) <- num.sample$RNAid[ncolum]
+  p <- ggplot(data = dataGG, aes(x = PC1, y = PC2, color = WUR, shape = Vac, label = Name)) + 
+    geom_point(size = I(2))+ 
+    ggplot2::ggtitle(paste0("Time point = ", timepoint, " dpv"))+
+    ggplot2::xlab(label =paste0("PC1, VarExp:", round(percenvar[1],1) ))+
+    ggplot2::ylab((label = paste0("PC2, VarExp:", round(percenvar[2],1))))
+p
+}
+
+timevec <- sort(unique(num.sample$dpv))
+timevec
+ggplotly(pcaplot(timepoint = timevec[1]))
+```
+Check outliers samples.
+```{r}
+barplot(apply(dat1[, num.sample$dpv==timevec[1]], 2, sum),las = 2, main = paste0("dpv = ", timevec[1]))
+
+```
+```{r}
+
+ggplotly(pcaplot(timepoint = timevec[2]))
+
+```
+Check outliers samples.
+```{r}
+barplot(apply(dat1[, num.sample$dpv==timevec[2]], 2, sum),las = 2, main = paste0("dpv = ", timevec[2]))
+
+```
+```{r}
+
+ggplotly(pcaplot(timepoint = timevec[3]))
+
+
+```
+Check outliers samples.
+```{r}
+barplot(apply(dat1[, num.sample$dpv==timevec[3]], 2, sum),las = 2, main = paste0("dpv = ", timevec[3]))
+
+```
+
+```{r}
+
+ggplotly(pcaplot(timepoint = timevec[4]))
+
+
+
+```
+Check outliers samples.
+```{r}
+barplot(apply(dat1[, num.sample$dpv==timevec[4]], 2, sum),las = 2, main = paste0("dpv = ", timevec[4]))
+
+```
+```{r}
+
+ggplotly(pcaplot(timepoint = timevec[5]))
+
+
+```
+Check outliers samples.
+```{r}
+barplot(apply(dat1[, num.sample$dpv==timevec[5]], 2, sum),las = 2, main = paste0("dpv = ", timevec[5]))
+
+```
+
+```{r}
+
+ggplotly(pcaplot(timepoint = timevec[6]))
+
+
+```
+
+Check outliers samples.
+```{r}
+barplot(apply(dat1[, num.sample$dpv==timevec[6]], 2, sum),las = 2, main = paste0("dpv = ", timevec[6]))
+
+```
+```{r}
+
+ggplotly(pcaplot(timepoint = timevec[7]))
+
+
+```
+Check outliers samples.
+```{r}
+barplot(apply(dat1[, num.sample$dpv==timevec[7]], 2, sum),las = 2, main = paste0("dpv = ", timevec[7]))
+
+```
+```{r}
+
+ggplotly(pcaplot(timepoint = timevec[8]))
+
+
+```
+
+Check outliers samples.
+```{r}
+barplot(apply(dat1[, num.sample$dpv==timevec[8]], 2, sum),las = 2, main = paste0("dpv = ", timevec[8]))
+
+```
+```{r}
+
+ggplotly(pcaplot(timepoint = timevec[9]))
+
+
+```
+Check outliers samples.
+```{r}
+barplot(apply(dat1[, num.sample$dpv==timevec[9]], 2, sum),las = 2, main = paste0("dpv = ", timevec[9]))
+
+```
+
+
+```{r}
+
+ggplotly(pcaplot(timepoint = timevec[10]))
+
+
+```
+
+Check outlier samples.
+```{r}
+
+barplot(apply(dat1[, num.sample$dpv==timevec[10]], 2, sum),las = 2, main = paste0("dpv = ", timevec[10]))
+```
+
+
+Save process data to data folder.
+```{r}
+library(plyr)
+out <- plyr::llply(timevec, function(timepoint){
+  counts <- dat[, num.sample$dpv==timepoint]
+  counts <- counts[rowMeans(counts) >2 & rowSums(counts > 0) >2, ]
+  covset <- num.sample %>% 
+    dplyr::filter(dpv == timepoint) %>% 
+    dplyr::select(RNAid, Litters, WUR, VacStatue, 
+                  PHGC_16_PigID, RINe, Plate, WUR_Vac) %>% 
+    dplyr::mutate(RNAid = as.character(RNAid), 
+                  Litters = as.factor(as.character(Litters)),
+                  WUR = as.factor(as.character(WUR)),
+                  VacStatue = as.factor(as.character(VacStatue)),
+                  PHGC_16_PigID = as.factor(as.character(PHGC_16_PigID)),
+                  Plate = as.factor(as.character(Plate)),
+                  WUR_Vac = as.factor(as.character(WUR_Vac))
+                  )
+  datout <- list(counts = counts, covset = covset)
+  saveRDS(datout, file = paste0("../data/dat_", timepoint, ".rds"))
+  datout
+  
+})
+names(out) <- paste0("dat_", timevec)
+saveRDS(out, file = paste0("../data/datall.rds"))
+
+
+```
+
+
